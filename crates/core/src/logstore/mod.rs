@@ -1044,7 +1044,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(table.version().unwrap(), 0);
-        assert_eq!(table.get_schema().unwrap(), &table_schema);
+        assert_eq!(table.snapshot().unwrap().schema(), &table_schema);
 
         let get_err = get_all_versions_from(table.log_store(), -2).await;
         assert!(get_err.is_err());
@@ -1065,7 +1065,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(table.version().unwrap(), 0);
-        assert_eq!(table.get_schema().unwrap(), &table_schema);
+        assert_eq!(table.snapshot().unwrap().schema(), &table_schema);
 
         let res = get_all_versions_from(table.log_store(), -1).await;
         assert!(res.is_ok());
