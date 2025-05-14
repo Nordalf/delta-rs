@@ -83,8 +83,10 @@ use either::Either;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use object_store::ObjectMeta;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use tracing::debug;
 use url::Url;
 
 use crate::delta_datafusion::expr::parse_predicate_expression;
@@ -1487,7 +1489,7 @@ impl DeltaDataChecker {
             return Ok(());
         }
         let table = MemTable::try_new(record_batch.schema(), vec![vec![record_batch.clone()]])?;
-        table.schema();
+        let schema = table.schema();
         // Use a random table name to avoid clashes when running multiple parallel tasks, e.g. when using a partitioned table
         let table_name: String = uuid::Uuid::new_v4().to_string();
         self.ctx.register_table(&table_name, Arc::new(table))?;
@@ -1507,11 +1509,32 @@ impl DeltaDataChecker {
             } else {
                 check.get_name()
             };
+            // If the field has a whitespace, we need to backtick it, since the expression is an unquoted string
+            let mut expression = check.get_expression().to_string();
+            // This regex tries to mitigate:
+            //       Product SKU LIKE 'Product SKU-%'
+            // Which would become the following without the regex:
+            //      `Product SKU` LIKE '`Product SKU`-%'
+            // Above would fail, since the match includes the backticks
+            let pre_regex = r"(?:^|\s)";
+            for field in schema.fields() {
+                if expression.contains(field.name()) && field.name().contains(" ") {
+                    let find_non_quoted_names =
+                        Regex::new(format!(r"{pre_regex}{}", field.name()).as_str()).unwrap();
+                    let cleaned_expression = find_non_quoted_names
+                        .replace_all(expression.as_str(), format!(" `{}`", field.name()));
+                    expression = cleaned_expression.to_string();
+                    break;
+                }
+            }
+
             let sql = format!(
                 "SELECT {} FROM `{table_name}` WHERE NOT ({}) LIMIT 1",
                 field_to_select,
                 check.get_expression()
             );
+
+            debug!("Data Check SQL Statement: {}", sql);
 
             let dfs: Vec<RecordBatch> = self.ctx.sql(&sql).await?.collect().await?;
             if !dfs.is_empty() && dfs[0].num_rows() > 0 {
