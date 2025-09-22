@@ -39,7 +39,7 @@ object_store = { version = "0.12.1" }
 parquet = { version = "57" }
 
 # datafusion
-datafusion = "51.0"
+datafusion = { version = "51.0", features = ["serde"]}
 datafusion-datasource = "51.0"
 datafusion-ffi = "51.0"
 datafusion-proto = "51.0"
