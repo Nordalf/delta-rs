@@ -808,11 +808,8 @@ pub async fn get_latest_version(
 /// vector of commit infos. We guarantee the length of the two vectors is equal
 pub async fn get_all_versions_from(
     log_store: LogStoreRef,
-    start_version: i64,
-) -> DeltaResult<(Vec<i64>, Vec<CommitInfo>)> {
-    if start_version < -1 {
-        return Err(DeltaTableError::NoStartingVersionOrTimestamp);
-    }
+    start_version: Option<Version>,
+) -> DeltaResult<(Vec<Version>, Vec<CommitInfo>)> {
     // list files to find max version
     let prefix = log_store.log_path();
     let offset_path = commit_uri_from_version(start_version);
@@ -820,7 +817,7 @@ pub async fn get_all_versions_from(
     let mut files = object_store.list_with_offset(Some(prefix), &offset_path);
     let mut empty_stream = true;
 
-    let mut versions = Vec::<i64>::new();
+    let mut versions = Vec::<Version>::new();
     let mut commit_files = Vec::<CommitInfo>::new();
 
     while let Some(obj_meta) = files.next().await {
@@ -829,20 +826,18 @@ pub async fn get_all_versions_from(
             .table_root_url()
             .join(meta.location.as_ref())
             .map_err(|fe| DeltaTableError::Generic(fe.to_string()))?;
-        if let Ok(Some(parsed_path)) = ParsedLogPath::try_from(file_url) {
-            if parsed_path.file_type == LogPathFileType::Commit {
-                let commit_log_bytes = object_store.get(&meta.location).await?.bytes().await?;
-                let reader = BufReader::new(Cursor::new(commit_log_bytes));
-                for line in reader.lines() {
-                    let action: Action = serde_json::from_str(line?.as_str())?;
-                    if let Action::CommitInfo(commit_info) = action {
-                        if let Some(log_version) =
-                            extract_version_from_filename(meta.location.as_ref())
-                        {
-                            versions.push(log_version);
-                            commit_files.push(commit_info);
-                        }
-                    }
+        if let Ok(Some(parsed_path)) = ParsedLogPath::try_from(file_url)
+            && parsed_path.file_type == LogPathFileType::Commit
+        {
+            let commit_log_bytes = object_store.get(&meta.location).await?.bytes().await?;
+            let reader = BufReader::new(Cursor::new(commit_log_bytes));
+            for line in reader.lines() {
+                let action: Action = serde_json::from_str(line?.as_str())?;
+                if let Action::CommitInfo(commit_info) = action
+                    && let Some(log_version) = extract_version_from_filename(meta.location.as_ref())
+                {
+                    versions.push(log_version);
+                    commit_files.push(commit_info);
                 }
             }
         }
@@ -853,19 +848,18 @@ pub async fn get_all_versions_from(
     // or starting_version is invalid, so we try to get the first commit entry
     if empty_stream {
         let obj_meta = object_store
-            .head(&commit_uri_from_version(0))
+            .head(&commit_uri_from_version(None))
             .await
             .map_err(|head_err| DeltaTableError::not_a_table(head_err.to_string()))?;
         let commit_log_bytes = object_store.get(&obj_meta.location).await?.bytes().await?;
         let reader = BufReader::new(Cursor::new(commit_log_bytes));
         for line in reader.lines() {
             let action: Action = serde_json::from_str(line?.as_str())?;
-            if let Action::CommitInfo(commit_info) = action {
-                if let Some(log_version) = extract_version_from_filename(obj_meta.location.as_ref())
-                {
-                    versions.push(log_version);
-                    commit_files.push(commit_info);
-                }
+            if let Action::CommitInfo(commit_info) = action
+                && let Some(log_version) = extract_version_from_filename(obj_meta.location.as_ref())
+            {
+                versions.push(log_version);
+                commit_files.push(commit_info);
             }
         }
     }
@@ -1258,7 +1252,7 @@ pub(crate) mod tests {
         assert_eq!(table.version(), Some(0));
         assert_eq!(table.snapshot().unwrap().schema(), Arc::new(table_schema));
 
-        let get_err = get_all_versions_from(table.log_store(), -2).await;
+        let get_err = get_all_versions_from(table.log_store(), Some(2)).await;
         assert!(get_err.is_err());
     }
 
@@ -1279,7 +1273,7 @@ pub(crate) mod tests {
         assert_eq!(table.version(), Some(0));
         assert_eq!(table.snapshot().unwrap().schema(), Arc::new(table_schema));
 
-        let res = get_all_versions_from(table.log_store(), -1).await;
+        let res = get_all_versions_from(table.log_store(), None).await;
         assert!(res.is_ok());
         let (versions, commit_infos) = res.unwrap();
 
