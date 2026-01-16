@@ -48,6 +48,7 @@ use crate::delta_datafusion::DeltaScanConfig;
 use crate::delta_datafusion::engine::DataFusionEngine;
 use crate::delta_datafusion::table_provider::TableProviderBuilder;
 use crate::kernel::{EagerSnapshot, Snapshot};
+use crate::logstore::LogStoreRef;
 
 mod scan;
 
@@ -98,11 +99,21 @@ impl SnapshotWrapper {
             SnapshotWrapper::EagerSnapshot(esnap) => esnap.snapshot(),
         }
     }
+
+    /// Get the eager snapshot if this wrapper contains one.
+    pub fn eager_snapshot(&self) -> Option<&Arc<EagerSnapshot>> {
+        match self {
+            SnapshotWrapper::EagerSnapshot(esnap) => Some(esnap),
+            SnapshotWrapper::Snapshot(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeltaScan {
     snapshot: SnapshotWrapper,
+    #[serde(skip)]
+    log_store: Option<LogStoreRef>,
     config: DeltaScanConfig,
     scan_schema: SchemaRef,
     /// Full schema including file_id column if configured
@@ -111,7 +122,11 @@ pub struct DeltaScan {
 
 impl DeltaScan {
     // create new delta scan
-    pub fn new(snapshot: impl Into<SnapshotWrapper>, config: DeltaScanConfig) -> Result<Self> {
+    pub fn new(
+        snapshot: impl Into<SnapshotWrapper>,
+        log_store: Option<LogStoreRef>,
+        config: DeltaScanConfig,
+    ) -> Result<Self> {
         let snapshot = snapshot.into();
         let scan_schema = config.table_schema(snapshot.table_configuration())?;
         let full_schema = if config.retain_file_id() {
@@ -123,6 +138,7 @@ impl DeltaScan {
         };
         Ok(Self {
             snapshot,
+            log_store,
             config,
             scan_schema,
             full_schema,
@@ -131,6 +147,31 @@ impl DeltaScan {
 
     pub fn builder() -> TableProviderBuilder {
         TableProviderBuilder::new()
+    }
+
+    /// Get a reference to the snapshot.
+    ///
+    /// This returns the underlying [`Snapshot`] which can be used to access
+    /// table metadata, schema, and other snapshot information.
+    pub fn snapshot(&self) -> &Snapshot {
+        self.snapshot.snapshot()
+    }
+
+    /// Get a reference to the log store, if available.
+    ///
+    /// This may be `None` if the `DeltaScan` was deserialized, as the log store
+    /// is not serializable and is skipped during serialization.
+    pub fn log_store(&self) -> Option<&LogStoreRef> {
+        self.log_store.as_ref()
+    }
+
+    /// Get a reference to the eager snapshot, if available.
+    ///
+    /// Returns `None` if the underlying snapshot is a lazy `Snapshot` rather
+    /// than an `EagerSnapshot`. The `EagerSnapshot` is needed for creating
+    /// a `DeltaTable` that can perform write operations.
+    pub fn eager_snapshot(&self) -> Option<&Arc<EagerSnapshot>> {
+        self.snapshot.eager_snapshot()
     }
 }
 
