@@ -1847,7 +1847,7 @@ impl RawDeltaTable {
             .map_err(PythonError::from)?
             .snapshot()
             .clone();
-        let scan = DeltaScanNext::new(snapshot, config).map_err(PythonError::from)?;
+        let scan = DeltaScanNext::new(snapshot, None, config).map_err(PythonError::from)?;
         let tokio_scan =
             Arc::new(TokioDeltaScan::new(scan, handle.clone())) as Arc<dyn TableProvider>;
         let provider = FFI_TableProvider::new(tokio_scan, false, Some(handle.clone()));
