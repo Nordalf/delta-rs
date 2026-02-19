@@ -2243,7 +2243,7 @@ Install datafusion=={required}.* (matching major) to use DataFusion SessionConte
             .snapshot()
             .clone();
 
-        let scan = DeltaScanNext::new(snapshot, None, config).map_err(PythonError::from)?;
+        let scan = DeltaScanNext::new(snapshot, config).map_err(PythonError::from)?;
         let tokio_scan = Arc::new(
             TokioDeltaScan::new(scan, handle.clone())
                 .with_object_store(object_store_url, object_store),
