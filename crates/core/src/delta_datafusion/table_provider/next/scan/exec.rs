@@ -399,8 +399,14 @@ impl ExecutionPlan for DeltaScanExec {
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         let stats = self.input.partition_statistics(partition)?;
-        self.map_statistics(Arc::unwrap_or_clone(stats))
-            .map(Arc::new)
+        let mut stats = self.map_statistics(Arc::unwrap_or_clone(stats))?;
+        // When deletion vectors are present, the inner parquet plan's row counts
+        // don't account for deleted rows. Mark num_rows as inexact so DataFusion's
+        // AggregateStatistics optimizer won't short-circuit COUNT(*) with inflated counts.
+        if !self.selection_vectors.is_empty() {
+            stats.num_rows = stats.num_rows.to_inexact();
+        }
+        Ok(Arc::new(stats))
     }
 
     fn gather_filters_for_pushdown(
