@@ -127,6 +127,10 @@ pub struct DeltaScanExec {
     properties: Arc<PlanProperties>,
     /// Aggregated partition column statistics
     partition_stats: HashMap<String, ColumnStatistics>,
+    /// The originating scan request, when planned via `DeltaScan::scan`. Enables
+    /// wire serialization by replaying the scan on the receiving side
+    /// (see [`DeltaScanExecCodec`](crate::delta_datafusion::DeltaScanExecCodec)).
+    replay: Option<Arc<super::super::ScanReplay>>,
 }
 
 impl DisplayAs for DeltaScanExec {
@@ -181,7 +185,19 @@ impl DeltaScanExec {
             input_file_id_column,
             file_id_column,
             properties,
+            replay: None,
         }
+    }
+
+    /// Attach the originating scan request for wire serialization support.
+    pub(crate) fn with_replay(mut self, replay: Arc<super::super::ScanReplay>) -> Self {
+        self.replay = Some(replay);
+        self
+    }
+
+    /// The originating scan request, when available.
+    pub(crate) fn replay(&self) -> Option<&Arc<super::super::ScanReplay>> {
+        self.replay.as_ref()
     }
 
     /// Transform the statistics from the inner physical parquet read plan to the logical
@@ -307,7 +323,10 @@ impl ExecutionPlan for DeltaScanExec {
         if children.len() != 1 {
             return plan_err!("DeltaScan: wrong number of children {}", children.len());
         }
-        Ok(Arc::new(Self::new(
+        // Rebuild via `new` so derived fields (plan properties: partitioning,
+        // emission) track the NEW child, then carry the replay over so the plan
+        // stays wire-serializable after child swaps.
+        let mut rebuilt = Self::new(
             self.scan_plan.clone(),
             children[0].clone(),
             self.transforms.clone(),
@@ -315,7 +334,9 @@ impl ExecutionPlan for DeltaScanExec {
             self.public_file_ids.clone(),
             self.partition_stats.clone(),
             self.metrics.clone(),
-        )))
+        );
+        rebuilt.replay = self.replay.clone();
+        Ok(Arc::new(rebuilt))
     }
 
     fn repartitioned(
