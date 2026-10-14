@@ -593,6 +593,55 @@ mod tests {
         use super::*;
 
         use crate::writer::test_utils::get_record_batch;
+        use arrow::array::RecordBatch;
+        use arrow_array::{Int32Array, TimestampMicrosecondArray};
+        use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit};
+        use std::sync::Arc;
+
+        #[tokio::test]
+        async fn test_create_table_with_timestamp_ntz_and_not_null_lists_invariants() {
+            // timestamp_ntz forces writer v7, where Delta-Spark requires `invariants` to be
+            // listed for the not-null column; the table must also stay writable by delta-rs.
+            let table = CreateBuilder::new()
+                .with_location("memory:///")
+                .with_columns([
+                    StructField::not_null("id", DataType::INTEGER),
+                    StructField::nullable("ts", DataType::TIMESTAMP_NTZ),
+                ])
+                .await
+                .unwrap();
+
+            let protocol = table.snapshot().unwrap().protocol().clone();
+            assert_eq!(protocol.min_writer_version(), 7);
+            let writer_features = protocol.writer_features().unwrap();
+            assert!(writer_features.contains(&TableFeature::Invariants));
+            assert!(writer_features.contains(&TableFeature::TimestampWithoutTimezone));
+
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, true),
+                Field::new(
+                    "ts",
+                    ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+            ]));
+            let batch = |ids: Vec<Option<i32>>| {
+                let ts = TimestampMicrosecondArray::from(vec![Some(1_000_000); ids.len()]);
+                RecordBatch::try_new(
+                    arrow_schema.clone(),
+                    vec![Arc::new(Int32Array::from(ids)), Arc::new(ts)],
+                )
+                .unwrap()
+            };
+
+            let table = table.write(vec![batch(vec![Some(1)])]).await.unwrap();
+            assert_eq!(table.version(), Some(1));
+
+            // The not-null check still applies on the v7 table.
+            let result = table.write(vec![batch(vec![None])]).await;
+            assert!(result.is_err());
+        }
+
         #[tokio::test]
         async fn test_create_table_save_mode() {
             let tmp_dir = tempfile::tempdir().unwrap();
