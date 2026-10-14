@@ -197,6 +197,25 @@ pub(crate) fn contains_variant<'a>(mut fields: impl Iterator<Item = &'a StructFi
     fields.any(|f| _check_type(f.data_type()))
 }
 
+/// checks if table contains a non-nullable field, including fields nested in structs, arrays and
+/// maps. Delta-Spark treats `nullable: false` as a column invariant, so such tables need the
+/// `invariants` writer feature once they are on writer version 7.
+pub(crate) fn contains_non_nullable<'a>(mut fields: impl Iterator<Item = &'a StructField>) -> bool {
+    fn _check_type(dtype: &DataType) -> bool {
+        match dtype {
+            DataType::Array(inner) => _check_type(inner.element_type()),
+            DataType::Struct(inner) => contains_non_nullable(inner.fields()),
+            DataType::Map(inner) => {
+                _check_type(inner.key_type()) || _check_type(inner.value_type())
+            }
+            // Variant internals are protocol-defined and always non-null, not user columns.
+            _ => false,
+        }
+    }
+
+    fields.any(|f| !f.is_nullable() || _check_type(f.data_type()))
+}
+
 /// Extension trait for delta-kernel Protocol action.
 ///
 /// Allows us to extend the Protocol struct with additional methods
@@ -455,7 +474,8 @@ impl ProtocolInner {
             self = self.enable_generated_columns()
         }
 
-        if !invariants.is_empty() {
+        // Runs after the feature checks above, since those can bump the writer to version 7.
+        if !invariants.is_empty() || contains_non_nullable(schema.fields()) {
             self = self.enable_invariants()
         }
 
@@ -1357,6 +1377,7 @@ pub(crate) fn writer_features_for_version(
 mod tests {
     use super::*;
     use crate::kernel::PrimitiveType;
+    use delta_kernel::schema::{ArrayType, MapType};
 
     #[test]
     fn test_primitive() {
@@ -1571,6 +1592,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn legacy_protocol() -> Protocol {
+        serde_json::from_value(serde_json::json!({
+            "minReaderVersion": 1,
+            "minWriterVersion": 2,
+        }))
+        .unwrap()
+    }
+
+    fn has_invariants(protocol: &Protocol) -> bool {
+        protocol
+            .writer_features()
+            .is_some_and(|f| f.contains(&TableFeature::Invariants))
+    }
+
+    #[test]
+    fn test_apply_column_metadata_enables_invariants_for_non_nullable_columns() {
+        // Delta-Spark treats `nullable: false` as an invariant. On writer v7 it refuses a table
+        // whose writerFeatures omit `invariants` (DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH).
+        // timestamp_ntz forces writer v7, so the not-null column must add the feature.
+        let ntz = StructField::nullable("ts", DataType::TIMESTAMP_NTZ);
+        let not_null_struct =
+            || StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap();
+        let cases = [
+            ("top-level", StructField::not_null("id", DataType::INTEGER)),
+            (
+                "nested in struct",
+                StructField::nullable("s", not_null_struct()),
+            ),
+            (
+                "nested in array element",
+                StructField::nullable("a", ArrayType::new(not_null_struct(), true)),
+            ),
+            (
+                "nested in map value",
+                StructField::nullable("m", MapType::new(DataType::STRING, not_null_struct(), true)),
+            ),
+        ];
+
+        for (case, field) in cases {
+            let schema = StructType::try_new([field, ntz.clone()]).unwrap();
+            let protocol = legacy_protocol()
+                .apply_column_metadata_to_protocol(&schema)
+                .unwrap();
+
+            assert_eq!(protocol.min_writer_version(), 7, "{case}");
+            assert!(has_invariants(&protocol), "{case}: {protocol:?}");
+            assert!(
+                protocol
+                    .writer_features()
+                    .is_some_and(|f| f.contains(&TableFeature::TimestampWithoutTimezone)),
+                "{case}: {protocol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_column_metadata_skips_invariants_when_not_needed() {
+        // All columns nullable: nothing implies an invariant.
+        let schema = StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("ts", DataType::TIMESTAMP_NTZ),
+        ])
+        .unwrap();
+        let protocol = legacy_protocol()
+            .apply_column_metadata_to_protocol(&schema)
+            .unwrap();
+        assert_eq!(protocol.min_writer_version(), 7);
+        assert!(!has_invariants(&protocol), "{protocol:?}");
+
+        // Legacy writer v2 already implies invariants: a not-null column must not bump to v7.
+        let schema = StructType::try_new([StructField::not_null("id", DataType::INTEGER)]).unwrap();
+        let protocol = legacy_protocol()
+            .apply_column_metadata_to_protocol(&schema)
+            .unwrap();
+        assert_eq!(protocol.min_reader_version(), 1);
+        assert_eq!(protocol.min_writer_version(), 2);
+        assert!(protocol.writer_features().is_none(), "{protocol:?}");
     }
 
     #[test]
