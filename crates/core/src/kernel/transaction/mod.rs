@@ -95,7 +95,7 @@ use self::conflict_checker::{TransactionInfo, WinningCommitSummary};
 use crate::errors::DeltaTableError;
 use crate::kernel::{
     Action, Add, CommitInfo, EagerSnapshot, IsolationLevel, Metadata, Protocol, Transaction,
-    Version,
+    Version, protocol_with_missing_invariants,
 };
 use crate::logstore::ObjectStoreRef;
 use crate::logstore::with_operation;
@@ -691,12 +691,11 @@ impl<'a> CommitBuilder {
         log_store: LogStoreRef,
         operation: DeltaOperation,
     ) -> PreCommit<'a> {
-        let data = CommitData::new(
-            self.actions,
-            operation,
-            self.app_metadata,
-            self.app_transaction,
-        );
+        let mut actions = self.actions;
+        if let Some(table) = table_data {
+            heal_missing_invariants(table, &mut actions);
+        }
+        let data = CommitData::new(actions, operation, self.app_metadata, self.app_transaction);
         PreCommit {
             log_store,
             table_data,
@@ -706,6 +705,40 @@ impl<'a> CommitBuilder {
             read_files: self.read_files,
         }
     }
+}
+
+/// Adds the `invariants` writer feature to a commit on a writer v7 table whose protocol omits it
+/// although the schema has a non-nullable field.
+///
+/// Older delta-rs versions created such tables, which Delta-Spark refuses
+/// (`DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH`). The repaired protocol rides in the commit that
+/// is being built, so the table heals on its next write without a separate commit. A commit that
+/// already carries a protocol action owns the protocol and is left alone. The schema is the one
+/// the commit leaves behind: its own metadata action when it has one, else the table's.
+fn heal_missing_invariants(table: &dyn TableReference, actions: &mut Vec<Action>) {
+    if actions.iter().any(|a| matches!(a, Action::Protocol(_))) {
+        return;
+    }
+    let schema = match actions.iter().find_map(|a| match a {
+        Action::Metadata(metadata) => Some(metadata),
+        _ => None,
+    }) {
+        Some(metadata) => match metadata.parse_schema() {
+            Ok(schema) => Arc::new(schema),
+            Err(_) => return,
+        },
+        None => table.eager_snapshot().schema(),
+    };
+    let Some(protocol) = protocol_with_missing_invariants(table.protocol(), &schema) else {
+        return;
+    };
+    info!("adding the missing invariants writer feature for non-nullable columns");
+    // CommitInfo must stay the first action to support in-commit timestamps.
+    let position = actions
+        .iter()
+        .position(|a| matches!(a, Action::CommitInfo(_)))
+        .map_or(0, |i| i + 1);
+    actions.insert(position, Action::Protocol(protocol));
 }
 
 /// Represents a commit that has not yet started but all details are finalized

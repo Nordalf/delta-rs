@@ -3893,4 +3893,307 @@ mod tests {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
+
+    /// A table that older delta-rs versions left behind: writer v7 (timestamp_ntz) with a
+    /// not-null column, but `invariants` missing from the writer features. Delta-Spark refuses it.
+    mod missing_invariants {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use arrow_array::{Array, Int32Array, RecordBatch, TimestampMicrosecondArray};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::prelude::{SessionContext, col, lit};
+        use delta_kernel::table_features::TableFeature;
+
+        use crate::DeltaTable;
+        use crate::errors::DeltaTableError;
+        use crate::kernel::transaction::{
+            CommitBuilder, CommitConflictError, TableReference, TransactionError,
+        };
+        use crate::kernel::{
+            Action, DataType as DeltaDataType, MetadataExt, Protocol, StructField, StructType,
+        };
+        use crate::logstore::get_actions;
+        use crate::protocol::DeltaOperation;
+
+        /// Rows for an `id` + `ts` table; `tz` is the timestamp's time zone (`None` = timestamp_ntz).
+        fn batch_in(ids: Vec<i32>, tz: Option<&str>) -> RecordBatch {
+            let ts = TimestampMicrosecondArray::from(vec![1_000_000; ids.len()])
+                .with_timezone_opt(tz.map(Arc::<str>::from));
+            let schema = ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("ts", ts.data_type().clone(), true),
+            ]);
+            RecordBatch::try_new(
+                Arc::new(schema),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(ts)],
+            )
+            .unwrap()
+        }
+
+        fn batch(ids: Vec<i32>) -> RecordBatch {
+            batch_in(ids, None)
+        }
+
+        async fn create(columns: Vec<StructField>) -> DeltaTable {
+            DeltaTable::new_in_memory()
+                .create()
+                .with_columns(columns)
+                .await
+                .unwrap()
+        }
+
+        /// Rows 1 and 2 at version 2, whose protocol action dropped `invariants`. CreateBuilder
+        /// always derives the feature from the schema, so the broken protocol is committed on
+        /// top of a healthy table instead.
+        async fn table_missing_invariants() -> DeltaTable {
+            let table = create(vec![
+                StructField::not_null("id", DeltaDataType::INTEGER),
+                StructField::nullable("ts", DeltaDataType::TIMESTAMP_NTZ),
+            ])
+            .await;
+            let mut table = table.write(vec![batch(vec![1, 2])]).await.unwrap();
+            let broken: Protocol = serde_json::from_value(serde_json::json!({
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["timestampNtz"],
+                "writerFeatures": ["timestampNtz"],
+            }))
+            .unwrap();
+            CommitBuilder::default()
+                .with_actions(vec![Action::Protocol(broken)])
+                .build(
+                    Some(table.snapshot().unwrap() as &dyn TableReference),
+                    table.log_store(),
+                    DeltaOperation::SetTableProperties {
+                        properties: HashMap::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            table.load().await.unwrap();
+            assert_eq!(table.version(), Some(2));
+            assert!(!lists_invariants(&table));
+            table
+        }
+
+        fn lists_invariants(table: &DeltaTable) -> bool {
+            table
+                .snapshot()
+                .unwrap()
+                .protocol()
+                .writer_features()
+                .is_some_and(|f| f.contains(&TableFeature::Invariants))
+        }
+
+        async fn commit_actions(table: &DeltaTable) -> Vec<Action> {
+            let version = table.version().unwrap();
+            let bytes = table
+                .log_store()
+                .read_commit_entry(version)
+                .await
+                .unwrap()
+                .unwrap();
+            get_actions(version, &bytes).unwrap()
+        }
+
+        fn protocols(actions: &[Action]) -> Vec<&Protocol> {
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::Protocol(p) => Some(p),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The commit carries exactly one protocol action, which lists `invariants` and keeps the
+        /// versions and the other features.
+        fn assert_healed(actions: &[Action]) {
+            let protocols = protocols(actions);
+            assert_eq!(protocols.len(), 1, "{actions:?}");
+            let protocol = protocols[0];
+            assert_eq!(protocol.min_reader_version(), 3);
+            assert_eq!(protocol.min_writer_version(), 7);
+            let features = protocol.writer_features().unwrap();
+            assert!(features.contains(&TableFeature::Invariants), "{protocol:?}");
+            assert!(
+                features.contains(&TableFeature::TimestampWithoutTimezone),
+                "{protocol:?}"
+            );
+            assert!(
+                matches!(actions.first(), Some(Action::CommitInfo(_))),
+                "commitInfo must stay first: {actions:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_write_heals_missing_invariants_in_the_data_commit() {
+            let table = table_missing_invariants().await;
+
+            let table = table.write(vec![batch(vec![3])]).await.unwrap();
+
+            assert_eq!(table.version(), Some(3));
+            let actions = commit_actions(&table).await;
+            assert_healed(&actions);
+            assert!(
+                actions.iter().any(|a| matches!(a, Action::Add(_))),
+                "{actions:?}"
+            );
+            assert!(lists_invariants(&table));
+
+            // Healthy now: the next commit carries no protocol action.
+            let table = table.write(vec![batch(vec![4])]).await.unwrap();
+            assert!(protocols(&commit_actions(&table).await).is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_delete_heals_missing_invariants_in_the_data_commit() {
+            let table = table_missing_invariants().await;
+
+            let (table, metrics) = table
+                .delete()
+                .with_predicate(col("id").eq(lit(1)))
+                .await
+                .unwrap();
+
+            assert_eq!(metrics.num_deleted_rows, Some(1));
+            let actions = commit_actions(&table).await;
+            assert_healed(&actions);
+            assert!(
+                actions.iter().any(|a| matches!(a, Action::Remove(_))),
+                "{actions:?}"
+            );
+            assert!(lists_invariants(&table));
+        }
+
+        #[tokio::test]
+        async fn test_merge_heals_missing_invariants_in_the_data_commit() {
+            let table = table_missing_invariants().await;
+            let source = SessionContext::new().read_batch(batch(vec![3])).unwrap();
+
+            let (table, metrics) = table
+                .merge(source, col("target.id").eq(col("source.id")))
+                .with_source_alias("source")
+                .with_target_alias("target")
+                .when_not_matched_insert(|insert| {
+                    insert
+                        .set("id", col("source.id"))
+                        .set("ts", col("source.ts"))
+                })
+                .unwrap()
+                .await
+                .unwrap();
+
+            assert_eq!(metrics.num_target_rows_inserted, 1);
+            let actions = commit_actions(&table).await;
+            assert_healed(&actions);
+            assert!(
+                actions.iter().any(|a| matches!(a, Action::Add(_))),
+                "{actions:?}"
+            );
+            assert!(lists_invariants(&table));
+        }
+
+        #[tokio::test]
+        async fn test_heal_reads_the_schema_the_commit_leaves_behind() {
+            // A commit with a metadata action is judged by its new schema, not the table's: here
+            // it makes every column nullable, so there is nothing to declare.
+            let mut table = table_missing_invariants().await;
+            let schema = StructType::try_new([
+                StructField::nullable("id", DeltaDataType::INTEGER),
+                StructField::nullable("ts", DeltaDataType::TIMESTAMP_NTZ),
+            ])
+            .unwrap();
+            let metadata = table
+                .snapshot()
+                .unwrap()
+                .metadata()
+                .clone()
+                .with_schema(&schema)
+                .unwrap();
+
+            let version = CommitBuilder::default()
+                .with_actions(vec![Action::Metadata(metadata)])
+                .build(
+                    Some(table.snapshot().unwrap() as &dyn TableReference),
+                    table.log_store(),
+                    DeltaOperation::SetTableProperties {
+                        properties: HashMap::new(),
+                    },
+                )
+                .await
+                .unwrap()
+                .version();
+
+            table.load_version(version).await.unwrap();
+            assert!(protocols(&commit_actions(&table).await).is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_healthy_tables_get_no_protocol_action() {
+            // Writer v7 that already lists `invariants`.
+            let v7 = create(vec![
+                StructField::not_null("id", DeltaDataType::INTEGER),
+                StructField::nullable("ts", DeltaDataType::TIMESTAMP_NTZ),
+            ])
+            .await;
+            assert!(lists_invariants(&v7));
+            // Legacy writer v2 with a not-null column: invariants are implied.
+            let v2 = create(vec![
+                StructField::not_null("id", DeltaDataType::INTEGER),
+                StructField::nullable("ts", DeltaDataType::TIMESTAMP),
+            ])
+            .await;
+            assert_eq!(v2.snapshot().unwrap().protocol().min_writer_version(), 2);
+
+            for (table, tz) in [(v7, None), (v2, Some("UTC"))] {
+                let protocol = table.snapshot().unwrap().protocol().clone();
+                let table = table.write(vec![batch_in(vec![1], tz)]).await.unwrap();
+                assert!(protocols(&commit_actions(&table).await).is_empty());
+                assert_eq!(table.snapshot().unwrap().protocol(), &protocol);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_stale_writer_conflicts_with_the_healing_commit() {
+            // Both handles read the broken protocol. The first write heals it; the second was
+            // built against the old protocol, so the conflict checker refuses it.
+            let first = table_missing_invariants().await;
+            let second = first.clone();
+
+            first.write(vec![batch(vec![3])]).await.unwrap();
+            let result = second.write(vec![batch(vec![4])]).await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(DeltaTableError::Transaction {
+                        source: TransactionError::CommitConflict(
+                            CommitConflictError::ProtocolChanged(_)
+                        )
+                    })
+                ),
+                "{:?}",
+                result.err()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_concurrent_appends_on_a_healthy_table_both_commit() {
+            // Control for the conflict above: without a healing commit, blind appends from two
+            // handles at the same version both succeed.
+            let first = create(vec![
+                StructField::not_null("id", DeltaDataType::INTEGER),
+                StructField::nullable("ts", DeltaDataType::TIMESTAMP_NTZ),
+            ])
+            .await;
+            let second = first.clone();
+
+            let first = first.write(vec![batch(vec![1])]).await.unwrap();
+            let second = second.write(vec![batch(vec![2])]).await.unwrap();
+
+            assert_eq!((first.version(), second.version()), (Some(1), Some(2)));
+        }
+    }
 }

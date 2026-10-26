@@ -219,6 +219,34 @@ pub(crate) fn contains_non_nullable<'a>(mut fields: impl Iterator<Item = &'a Str
     fields.any(|f| !f.is_nullable() || _check_type(f.data_type()))
 }
 
+/// Returns `protocol` with the `invariants` writer feature appended when a writer v7 protocol
+/// omits it although `schema` has a non-nullable field, and `None` when nothing is missing.
+///
+/// Delta-Spark refuses such a table (`DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH`). Legacy writer
+/// versions (< 7) imply `invariants`, so they never need it listed.
+pub(crate) fn protocol_with_missing_invariants(
+    protocol: &Protocol,
+    schema: &StructType,
+) -> Option<Protocol> {
+    if protocol.min_writer_version() < 7 {
+        return None;
+    }
+    if protocol
+        .writer_features()
+        .is_some_and(|f| f.contains(&TableFeature::Invariants))
+    {
+        return None;
+    }
+    if !contains_non_nullable(schema.fields()) {
+        return None;
+    }
+    Some(
+        ProtocolInner::from_kernel(protocol)
+            .append_writer_features([TableFeature::Invariants])
+            .as_kernel(),
+    )
+}
+
 /// Extension trait for delta-kernel Protocol action.
 ///
 /// Allows us to extend the Protocol struct with additional methods
@@ -1665,6 +1693,88 @@ mod tests {
         assert_eq!(protocol.min_reader_version(), 1);
         assert_eq!(protocol.min_writer_version(), 2);
         assert!(protocol.writer_features().is_none(), "{protocol:?}");
+    }
+
+    /// The writer v7 protocol older delta-rs versions wrote for a timestamp_ntz table with a
+    /// not-null column: `invariants` is missing.
+    fn protocol_without_invariants() -> Protocol {
+        serde_json::from_value(serde_json::json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["timestampNtz"],
+            "writerFeatures": ["timestampNtz"],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_protocol_with_missing_invariants_appends_the_feature() {
+        let not_null_struct =
+            || StructType::try_new([StructField::not_null("x", DataType::INTEGER)]).unwrap();
+        let cases = [
+            ("top-level", StructField::not_null("id", DataType::INTEGER)),
+            (
+                "nested in struct",
+                StructField::nullable("s", not_null_struct()),
+            ),
+            (
+                "nested in array element",
+                StructField::nullable("a", ArrayType::new(not_null_struct(), true)),
+            ),
+            (
+                "nested in map value",
+                StructField::nullable("m", MapType::new(DataType::STRING, not_null_struct(), true)),
+            ),
+        ];
+        let before = protocol_without_invariants();
+
+        for (case, field) in cases {
+            let schema =
+                StructType::try_new([field, StructField::nullable("ts", DataType::TIMESTAMP_NTZ)])
+                    .unwrap();
+            let protocol = protocol_with_missing_invariants(&before, &schema)
+                .unwrap_or_else(|| panic!("{case}: expected a repaired protocol"));
+
+            assert!(has_invariants(&protocol), "{case}: {protocol:?}");
+            assert_eq!(protocol.min_reader_version(), 3, "{case}");
+            assert_eq!(protocol.min_writer_version(), 7, "{case}");
+            assert_eq!(
+                protocol.reader_features(),
+                before.reader_features(),
+                "{case}"
+            );
+            assert!(
+                protocol
+                    .writer_features()
+                    .is_some_and(|f| f.contains(&TableFeature::TimestampWithoutTimezone)),
+                "{case}: {protocol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocol_with_missing_invariants_is_none_when_nothing_is_missing() {
+        let not_null =
+            StructType::try_new([StructField::not_null("id", DataType::INTEGER)]).unwrap();
+
+        // Writer v7, all columns nullable: no invariant to declare.
+        let nullable = StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("ts", DataType::TIMESTAMP_NTZ),
+        ])
+        .unwrap();
+        assert!(
+            protocol_with_missing_invariants(&protocol_without_invariants(), &nullable).is_none()
+        );
+
+        // Writer v7 that already lists `invariants`.
+        let listed = ProtocolInner::from_kernel(&protocol_without_invariants())
+            .append_writer_features([TableFeature::Invariants])
+            .as_kernel();
+        assert!(protocol_with_missing_invariants(&listed, &not_null).is_none());
+
+        // Legacy writer v2 implies invariants.
+        assert!(protocol_with_missing_invariants(&legacy_protocol(), &not_null).is_none());
     }
 
     #[test]
